@@ -1,33 +1,46 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-  # 指定UTF-8编码，避免中文注释乱码
 """
-@author:XuMing(xuming624@qq.com)
-@description: Train a model from SFT using DPO
-"""
-import os
-from copy import deepcopy
-from dataclasses import dataclass, field
-from glob import glob
-from typing import Dict, Optional
+作者: XuMing (xuming624@qq.com)
+用途: 基于已完成SFT的模型进行DPO(Direct Preference Optimization)训练
 
-import torch
-from datasets import load_dataset
-from loguru import logger
-from peft import LoraConfig, TaskType
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    HfArgumentParser,
-    TrainingArguments,
-    BitsAndBytesConfig,
+你将看到：
+- 参数说明与解析，量化/LoRA/并行策略
+- 分词器与模板处理、数据集加载、预处理映射
+- 模型加载、梯度检查点、量化(QLoRA)配置
+- DPO 训练配置与训练器初始化、训练/评估/保存
+- 行内中文注释；在涉及计算时附公式与形状说明
+
+核心目标（DPO损失）：给定同一提示x下的优选回答y+与弃选回答y-，定义
+    Δ = β * [ (log π_θ(y+|x) - log π_θ(y−|x)) - (log π_ref(y+|x) - log π_ref(y−|x)) ]
+    loss = - E_{(x,y+,y−)} [ log σ(Δ) ]，其中 σ(z) = 1 / (1 + e^{−z})
+β(temperature) 控制KL偏好强度；π_ref通常为初始SFT策略或其冻结副本。
+在TRL的DPOTrainer中会自动完成打分、差分与损失计算。
+"""
+import os  # 读取环境变量、判断路径
+from copy import deepcopy  # 深拷贝模型作为参考策略（非PEFT时）
+from dataclasses import dataclass, field  # dataclass用于参数容器
+from glob import glob  # 递归匹配本地数据文件
+from typing import Dict, Optional  # 类型提示
+
+import torch  # 张量与模型训练
+from datasets import load_dataset  # 加载Hub或本地数据集
+from loguru import logger  # 日志库
+from peft import LoraConfig, TaskType  # LoRA配置
+from transformers import (  # Transformers核心组件
+    AutoConfig,  # 模型配置加载
+    AutoModelForCausalLM,  # 因果语言模型作为策略
+    AutoTokenizer,  # 分词器
+    HfArgumentParser,  # 参数解析器
+    TrainingArguments,  # (未直接使用，保留导入)
+    BitsAndBytesConfig,  # 4/8bit量化配置
 )
-from transformers.integrations import is_deepspeed_zero3_enabled
-from trl import DPOTrainer, DPOConfig
+from transformers.integrations import is_deepspeed_zero3_enabled  # 检测DeepSpeed ZeRO3
+from trl import DPOTrainer, DPOConfig  # TRL中的DPO训练器与配置
 
-from template import get_conv_template
+from template import get_conv_template  # 对话模板，拼接system/history/question成prompt
 
-os.environ["TOKENIZERS_PARALLELISM"] = "FALSE"
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["TOKENIZERS_PARALLELISM"] = "FALSE"  # 关闭并行以减少tokenizer警告
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # 允许MKL重复加载，避免某些环境崩溃
 
 
 @dataclass
@@ -37,118 +50,105 @@ class ScriptArguments:
     """
     # Model arguments
     model_name_or_path: Optional[str] = field(
-        default=None, metadata={"help": "The model checkpoint for weights initialization."}
+        default=None, metadata={"help": "基础模型(SFT后)路径或HF名称，作为DPO策略π_θ"}
     )
     tokenizer_name_or_path: Optional[str] = field(
-        default=None, metadata={"help": "The tokenizer for weights initialization."}
+        default=None, metadata={"help": "分词器路径；缺省则复用model_name_or_path"}
     )
-    load_in_8bit: bool = field(default=False, metadata={"help": "Whether to load the model in 8bit mode or not."})
-    load_in_4bit: bool = field(default=False, metadata={"help": "Whether to load the model in 4bit mode or not."})
+    load_in_8bit: bool = field(default=False, metadata={"help": "8bit量化加载，显存更省"})
+    load_in_4bit: bool = field(default=False, metadata={"help": "4bit量化加载，显存更省(配合QLoRA)"})
     cache_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
+        metadata={"help": "HF缓存目录，存放下载的模型/数据"},
     )
     use_fast_tokenizer: bool = field(
         default=False,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+        metadata={"help": "是否使用Fast分词器(tokenizers实现)"},
     )
     torch_dtype: Optional[str] = field(
         default=None,
         metadata={
             "help": (
-                "Override the default `torch.dtype` and load the model under this dtype. If `auto` is passed, the "
-                "dtype will be automatically derived from the model's weights."
+                "覆盖默认dtype，auto表示按权重推断；可选bfloat16/float16/float32"
             ),
             "choices": ["auto", "bfloat16", "float16", "float32"],
         },
     )
     device_map: Optional[str] = field(
         default="auto",
-        metadata={"help": "Device to map model to. If `auto` is passed, the device will be selected automatically. "},
+        metadata={"help": "模型模块映射；auto按显存自动切分到设备"},
     )
     trust_remote_code: bool = field(
         default=True,
-        metadata={"help": "Whether to trust remote code when loading a model from a remote checkpoint."},
+        metadata={"help": "加载远程自定义模型代码时是否信任"},
     )
     # Dataset arguments
     dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default=None, metadata={"help": "HF Hub数据集名称；None则读取本地json/jsonl"}
     )
     dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+        default=None, metadata={"help": "数据集子配置，如语言/子任务"}
     )
-    train_file_dir: Optional[str] = field(default=None, metadata={"help": "The input jsonl data file folder."})
-    validation_file_dir: Optional[str] = field(default=None, metadata={"help": "The evaluation jsonl file folder."}, )
-    template_name: Optional[str] = field(default="vicuna", metadata={"help": "The prompt template name."})
-    per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "Train batch size per device"})
-    per_device_eval_batch_size: Optional[int] = field(default=1, metadata={"help": "Eval batch size per device"})
-    max_source_length: Optional[int] = field(default=2048, metadata={"help": "Max length of prompt input text"})
-    max_target_length: Optional[int] = field(default=512, metadata={"help": "Max length of output text"})
-    min_target_length: Optional[int] = field(default=4, metadata={"help": "Min length of output text"})
+    train_file_dir: Optional[str] = field(default=None, metadata={"help": "训练数据文件夹(支持递归*.json/jsonl)"})
+    validation_file_dir: Optional[str] = field(default=None, metadata={"help": "验证数据文件夹"}, )
+    template_name: Optional[str] = field(default="vicuna", metadata={"help": "对话模板名称，决定prompt格式"})
+    per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "单卡训练批大小"})
+    per_device_eval_batch_size: Optional[int] = field(default=1, metadata={"help": "单卡评估批大小"})
+    max_source_length: Optional[int] = field(default=2048, metadata={"help": "prompt最大长度上限(字符级粗控)"})
+    max_target_length: Optional[int] = field(default=512, metadata={"help": "回答最大长度上限(字符级粗控)"})
+    min_target_length: Optional[int] = field(default=4, metadata={"help": "回答最小长度(用于生成控制)"})
     max_train_samples: Optional[int] = field(
         default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of training examples to this "
-                "value if set."
-            )
-        },
+        metadata={"help": "限制训练样本数用于调试或加速"},
     )
     max_eval_samples: Optional[int] = field(
         default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-                "value if set."
-            )
-        },
+        metadata={"help": "限制评估样本数"},
     )
     overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+        default=False, metadata={"help": "是否覆盖datasets缓存"}
     )
     validation_split_percentage: Optional[int] = field(
         default=1,
-        metadata={
-            "help": "The percentage of the train set used as validation set in case there's no validation split"
-        },
+        metadata={"help": "当无validation split时，从train划分的比例(%)"},
     )
     preprocessing_num_workers: Optional[int] = field(
-        default=4, metadata={"help": "The number of processes to use for the preprocessing."},
+        default=4, metadata={"help": "map/filter等预处理并行进程数"},
     )
     # Training arguments
-    use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
-    qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
-    target_modules: Optional[str] = field(default=None)
+    use_peft: bool = field(default=True, metadata={"help": "是否使用PEFT/LoRA"})
+    qlora: bool = field(default=False, metadata={"help": "是否使用QLoRA(4bit+LoRA)"})
+    target_modules: Optional[str] = field(default=None)  # 逗号分隔的LoRA注入目标名；含'all'表示自动发现
     lora_rank: Optional[int] = field(default=8)
     lora_dropout: Optional[float] = field(default=0.05)
     lora_alpha: Optional[float] = field(default=16.0)
-    peft_path: Optional[str] = field(default=None)
-    do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
-    do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the validation set."})
-    learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "Learning rate"})
-    lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "The lr scheduler type"})
-    warmup_steps: Optional[int] = field(default=100, metadata={"help": "The number of warmup steps"})
-    weight_decay: Optional[float] = field(default=0.05, metadata={"help": "The weight decay"})
-    optim: Optional[str] = field(default="adamw_hf", metadata={"help": "The optimizer type"})
-    fp16: Optional[bool] = field(default=True, metadata={"help": "Whether to use fp16"})
-    bf16: Optional[bool] = field(default=False, metadata={"help": "Whether to use bf16"})
+    peft_path: Optional[str] = field(default=None)  # 已有LoRA权重路径
+    do_train: bool = field(default=False, metadata={"help": "是否执行训练"})
+    do_eval: bool = field(default=False, metadata={"help": "是否在验证集上评估"})
+    learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "学习率"})
+    lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "学习率调度器类型"})
+    warmup_steps: Optional[int] = field(default=100, metadata={"help": "warmup步数"})
+    weight_decay: Optional[float] = field(default=0.05, metadata={"help": "权重衰减"})
+    optim: Optional[str] = field(default="adamw_hf", metadata={"help": "优化器类型"})
+    fp16: Optional[bool] = field(default=True, metadata={"help": "是否使用fp16"})
+    bf16: Optional[bool] = field(default=False, metadata={"help": "是否使用bf16"})
     gradient_checkpointing: Optional[bool] = field(
-        default=True, metadata={"help": "Whether to use gradient checkpointing"}
+        default=True, metadata={"help": "是否启用梯度检查点(省显存)"}
     )
     gradient_accumulation_steps: Optional[int] = field(
-        default=4, metadata={"help": "The number of gradient accumulation steps"}
+        default=4, metadata={"help": "梯度累积步数(等效大batch)"}
     )
-    save_steps: Optional[int] = field(default=50, metadata={"help": "X steps to save the model"})
-    eval_steps: Optional[int] = field(default=50, metadata={"help": "X steps to evaluate the model"})
-    logging_steps: Optional[int] = field(default=1, metadata={"help": "X steps to log the model"})
-    output_dir: Optional[str] = field(default="outputs-dpo", metadata={"help": "The output directory"})
-    max_steps: Optional[int] = field(default=200, metadata={"help": "Number of steps to train"})
-    eval_strategy: Optional[str] = field(default="steps", metadata={"help": "Evaluation strategy"})
+    save_steps: Optional[int] = field(default=50, metadata={"help": "每隔多少步保存一次"})
+    eval_steps: Optional[int] = field(default=50, metadata={"help": "每隔多少步评估一次"})
+    logging_steps: Optional[int] = field(default=1, metadata={"help": "日志打印步间隔"})
+    output_dir: Optional[str] = field(default="outputs-dpo", metadata={"help": "输出目录"})
+    max_steps: Optional[int] = field(default=200, metadata={"help": "总训练步数(steps)"})
+    eval_strategy: Optional[str] = field(default="steps", metadata={"help": "评估策略：steps/epoch/none"})
     remove_unused_columns: Optional[bool] = field(
         default=False,
-        metadata={"help": "Remove unused columns from the dataset if `datasets.Dataset` is used"},
+        metadata={"help": "dataset到trainer过程中是否移除未使用列(保持False以保留prompt等)"},
     )
-    report_to: Optional[str] = field(default="tensorboard", metadata={"help": "Report to wandb or tensorboard"})
+    report_to: Optional[str] = field(default="tensorboard", metadata={"help": "日志后端：wandb或tensorboard"})
 
     def __post_init__(self):
         if self.model_name_or_path is None:
@@ -198,6 +198,15 @@ def main():
     logger.info(f"Parse args: {args}")
 
     # Load tokenizer
+    # 说明：DPOTrainer会使用processing_class(=tokenizer)在内部完成tokenize与截断；
+    # 这里先确保特殊符号完整（bos/eos/pad），避免后续拼接prompt+completion时丢terminator。
+    # 形状预期（在trainer内部）：
+    # - 对于每个样本i，存在三段文本：prompt_i、chosen_i、rejected_i。
+    # - tokenizer会分别对拼接序列[tokenized(prompt_i + chosen_i)]与[tokenized(prompt_i + rejected_i)]编码。
+    # - 记L_p为prompt长度，L_c/L_r为两个completion长度；批内padding到max_prompt_length/max_length。
+    #   输入张量大致为：
+    #   input_ids_chosen: [B, L_max]，attention_mask同形；logits: [B, L_max, V]。
+    #   DPO仅对completion位置(去除prompt)的token计算对数似然差分。
     tokenizer_kwargs = {
         "cache_dir": args.cache_dir,
         "use_fast": args.use_fast_tokenizer,
@@ -279,6 +288,8 @@ def main():
     logger.info(f"Raw datasets: {raw_datasets}")
 
     # Preprocessing the datasets
+    # 注意：此阶段仅在原始样本上构造三字段{prompt, chosen, rejected}（均为字符串），不做tokenize。
+    # tokenize与截断由DPOTrainer根据DPOConfig在内部完成，减少重复存储。
     max_source_length = args.max_source_length
     max_target_length = args.max_target_length
     full_max_length = max_source_length + max_target_length
@@ -293,8 +304,15 @@ def main():
             'rejected': List[str],
         }
 
-        Prompts are structured as follows:
-          system_prompt + history[[q,a], [q,a]...] + question
+                Prompts are structured as follows:
+                    system_prompt + history[[q,a], [q,a]...] + question
+                形状与数据流：
+                - 输入字段：system: str | None, history: List[[q,a]], question: str。
+                - 输出字段：
+                    prompt: List[str]，每个元素为已格式化的对话前缀（长度约为字符级L_p_char）。
+                    chosen/rejected: List[str]，对应两种回答（字符级长度L_c_char/L_r_char）。
+                - DPOTrainer内部会将prompt与chosen/rejected逐一拼接后再tokenize，
+                    在计算损失时仅对completion片段计算log pθ与log pref。
         """
         prompts = []
         for system, history, question in zip(examples["system"], examples["history"], examples["question"]):
@@ -327,6 +345,8 @@ def main():
             load_from_cache_file=not args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
+        # 这里的长度过滤使用字符长度近似控制（非token数），避免极端长样本；
+        # 真正的token级截断在trainer侧按max_prompt_length/max_length执行。
         train_dataset = tokenized_dataset.filter(
             lambda x: 0 < len(x['prompt'] + x['chosen']) <= full_max_length
                       and 0 < len(x['prompt'] + x['rejected']) <= full_max_length
@@ -357,6 +377,7 @@ def main():
             load_from_cache_file=not args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
+        # 同训练集，字符级近似过滤
         eval_dataset = eval_dataset.filter(
             lambda x: 0 < len(x['prompt'] + x['chosen']) <= full_max_length
                       and 0 < len(x['prompt'] + x['rejected']) <= full_max_length
@@ -369,6 +390,9 @@ def main():
         logger.debug(f"rejected:\n{first_example['rejected']}")
 
     # Load model
+    # Load model
+    # dtype选择：auto/None -> 由权重推断；否则按"bfloat16"/"float16"/"float32"映射到torch.*。
+    # QLoRA场景：load_in_4bit=True时会构造BitsAndBytesConfig，权重以4bit量化+32bit优化器state进行训练。
     torch_dtype = (
         args.torch_dtype
         if args.torch_dtype in ["auto", None]
@@ -404,7 +428,7 @@ def main():
             bnb_4bit_compute_dtype=torch_dtype,
         ) if args.qlora else None,
     )
-    # fixed FP16 ValueError
+    # 将参与训练的参数显式转为FP32，规避部分模型在FP16下的数值/稳定性问题（如某些LayerNorm或LoRA权重初始化导致的溢出）。
     for param in filter(lambda p: p.requires_grad, model.parameters()):
         param.data = param.data.to(torch.float32)
 
@@ -415,6 +439,7 @@ def main():
     else:
         model.config.use_cache = True
 
+    # DPOConfig：控制token截断、batch、累计步数等；注意max_prompt_length+max_length应覆盖prompt+completion的token预算。
     training_args = DPOConfig(
         max_prompt_length=args.max_source_length,
         max_length=full_max_length,
@@ -457,13 +482,18 @@ def main():
         )
     else:
         logger.info("Fine-tuning method: Full parameters training")
+    # DPOTrainer数据流与损失：
+    # - 对每个样本，计算Δ = β[(log πθ(y+|x) − log πθ(y−|x)) − (log πref(y+|x) − log πref(y−|x))]
+    #   loss = − log σ(Δ)。其中log概率是沿completion token序列求和后得到的标量。
+    # - ref_model：当未使用PEFT(full finetune)时，复制一份冻结的参考策略；使用PEFT时传None以节省显存，
+    #   库侧会根据实现选择共享/复制base权重用于参考打分（具体行为依赖所用TRL版本）。
     trainer = DPOTrainer(
         model,
         ref_model=None if args.use_peft else deepcopy(model),
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        processing_class=tokenizer,
+        processing_class=tokenizer,  # 由trainer内部完成tokenize/截断/拼接
         peft_config=peft_config if args.use_peft else None,
     )
     print_trainable_parameters(trainer.model)
